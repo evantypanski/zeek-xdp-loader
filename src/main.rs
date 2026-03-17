@@ -1,56 +1,100 @@
+mod maps;
+
 use anyhow::Context as _;
 use aya::EbpfLoader;
-use aya::Pod;
-use aya::maps::HashMap;
-use aya::programs::{Xdp, XdpFlags};
-use clap::Parser;
-use log::{debug, warn};
-use tokio::signal;
+use aya::programs::{Xdp, XdpFlags, links::FdLink};
+use clap::{Parser, Subcommand, ValueEnum};
+use log::debug;
 
+use std::fmt;
 use std::path::Path;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct canonical_tuple {
-    pub ip1: [u8; 16],
-    pub ip2: [u8; 16],
-    pub port1: u16,
-    pub port2: u16,
-    pub protocol: u16,
-    pub outer_vlan_id: u16,
-    pub inner_vlan_id: u16,
-    pub _padding: u16,
-}
-
-unsafe impl Pod for canonical_tuple {}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct shunt_val {
-    pub lock_pad: u32,
-    pub packets_from_1: u64,
-    pub packets_from_2: u64,
-    pub bytes_from_1: u64,
-    pub bytes_from_2: u64,
-    pub timestamp: u64,
-}
-
-unsafe impl Pod for shunt_val {}
 
 #[derive(Debug, Parser)]
 struct Opt {
-    #[clap(short, long, default_value = "veth-test")]
-    iface: String,
-    #[clap(short, long)]
-    obj: String,
+    #[command(subcommand)]
+    command: Commands,
     #[clap(long, default_value = "/sys/fs/bpf/zeek")]
     pin_path_prefix: String,
-    #[clap(long, default_value_t = 65535)]
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MapTy {
+    FlowMap,
+    IpPairMap,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum XdpMode {
+    Native,
+    Skb,
+    Hw,
+    #[default]
+    Unspecified,
+}
+
+impl fmt::Display for XdpMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            XdpMode::Native => write!(f, "native"),
+            XdpMode::Skb => write!(f, "skb"),
+            XdpMode::Hw => write!(f, "hw"),
+            XdpMode::Unspecified => write!(f, "unspecified"),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Load {
+        #[clap(short, long)]
+        obj: String,
+        #[clap(short, long, default_value = "veth-test")]
+        iface: String,
+        #[clap(short, long, default_value_t)]
+        mode: XdpMode,
+        #[clap(long, default_value_t = 65535)]
+        flow_map_max_size: u32,
+        #[clap(long, default_value_t = 65535)]
+        ip_pair_map_max_size: u32,
+    },
+    Count {
+        #[arg(long, value_enum)]
+        map: MapTy,
+    },
+}
+
+fn load_command(
+    obj: &str,
+    pin_path: &Path,
+    iface: &str,
+    mode: XdpMode,
     flow_map_max_size: u32,
-    #[clap(long, default_value_t = 65535)]
     ip_pair_map_max_size: u32,
-    #[clap(short, long, default_value = "unspecified")]
-    mode: String,
+) -> anyhow::Result<()> {
+    let mut ebpf = EbpfLoader::new()
+        .default_map_pin_directory(pin_path)
+        .map_max_entries("filter_map", flow_map_max_size)
+        .map_max_entries("ip_pair_map", ip_pair_map_max_size)
+        .load_file(obj)?;
+
+    let program: &mut Xdp = ebpf.program_mut("xdp_filter").unwrap().try_into()?;
+    program.load()?;
+    let mut flags = XdpFlags::default();
+    match mode {
+        XdpMode::Native => flags.insert(XdpFlags::DRV_MODE),
+        XdpMode::Skb => flags.insert(XdpFlags::SKB_MODE),
+        XdpMode::Hw => flags.insert(XdpFlags::HW_MODE),
+        XdpMode::Unspecified => (),
+    }
+    let link_id = program.attach(iface, XdpFlags::default())
+        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+
+    // Pin the link so that the program stays alive
+    let link = program.take_link(link_id)?;
+    let fd_link = FdLink::try_from(link).context("Hello")?;
+    fd_link.pin(pin_path.join(iface))?;
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -71,44 +115,41 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let Opt {
-        iface,
-        obj,
+        command,
         pin_path_prefix,
-        flow_map_max_size,
-        ip_pair_map_max_size,
-        mode,
     } = opt;
-
     let pin_path = Path::new(&pin_path_prefix);
-    std::fs::create_dir_all(pin_path)?;
-    let mut ebpf = EbpfLoader::new()
-        .default_map_pin_directory(pin_path)
-        .map_max_entries("filter_map", flow_map_max_size)
-        .map_max_entries("ip_pair_map", ip_pair_map_max_size)
-        .load_file(obj)?;
 
-    let program: &mut Xdp = ebpf.program_mut("xdp_filter").unwrap().try_into()?;
-    program.load()?;
-    let mut flags = XdpFlags::default();
-    match mode.to_lowercase().as_str() {
-        "native" => flags.insert(XdpFlags::DRV_MODE),
-        "skb" => flags.insert(XdpFlags::SKB_MODE),
-        "hw" => flags.insert(XdpFlags::HW_MODE),
-        "unspecified" => (),
-        _ => warn!("Unknown mode {mode}"),
+    match command {
+        Commands::Load {
+            obj,
+            iface,
+            mode,
+            flow_map_max_size,
+            ip_pair_map_max_size,
+        } => {
+            // May need to create the directory
+            std::fs::create_dir_all(pin_path)?;
+
+            load_command(
+                &obj,
+                pin_path,
+                &iface,
+                mode,
+                flow_map_max_size,
+                ip_pair_map_max_size,
+            )?;
+        }
+        // Just counts the entries in the map for debugging
+        Commands::Count { map } => {
+            let count = match map {
+                MapTy::FlowMap => maps::get_filter_map(pin_path)?.iter().count(),
+                MapTy::IpPairMap => maps::get_ip_pair_map(pin_path)?.iter().count(),
+            };
+
+            println!("Found {} entries in map.", count)
+        }
     }
-    program.attach(&iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
-
-    let flow_map: HashMap<_, canonical_tuple, shunt_val> =
-        HashMap::try_from(ebpf.map("filter_map").unwrap())?;
-
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
-
-    println!("Map length: {}", flow_map.iter().count());
 
     Ok(())
 }
