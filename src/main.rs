@@ -6,6 +6,7 @@ use aya::programs::{Xdp, XdpFlags, links::FdLink};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::debug;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
@@ -17,10 +18,20 @@ struct Opt {
     pin_path_prefix: String,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
 enum MapTy {
+    #[default]
     FlowMap,
     IpPairMap,
+}
+
+impl fmt::Display for MapTy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MapTy::FlowMap => write!(f, "flow-map"),
+            MapTy::IpPairMap => write!(f, "ip-pair-map"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -58,8 +69,14 @@ enum Commands {
         ip_pair_map_max_size: u32,
     },
     Count {
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, default_value_t)]
         map: MapTy,
+    },
+    Dump {
+        #[arg(long, value_enum, default_value_t)]
+        map: MapTy,
+        #[arg(short, long)]
+        json: bool,
     },
 }
 
@@ -94,6 +111,53 @@ fn load_command(
     let fd_link = FdLink::try_from(link).context("Hello")?;
     fd_link.pin(pin_path.join(iface))?;
 
+    Ok(())
+}
+
+fn dump_command_json(pin_path: &Path, map: MapTy) -> anyhow::Result<()> {
+    let mut out = HashMap::new();
+
+    match map {
+        MapTy::FlowMap => {
+            for ele in maps::get_filter_map(pin_path)?.iter() {
+                let (key, val) = ele?;
+                out.insert(format!("{key}"), val);
+            }
+        }
+        MapTy::IpPairMap => {
+            for ele in maps::get_ip_pair_map(pin_path)?.iter() {
+                let (key, val) = ele?;
+                out.insert(format!("{key}"), val);
+            }
+        }
+    }
+
+    let json_output = serde_json::to_string_pretty(&out)?;
+    println!("{json_output}");
+
+    Ok(())
+}
+
+fn dump_command_txt(pin_path: &Path, map: MapTy) -> anyhow::Result<()> {
+    println!("Dumping {}:", map);
+    match map {
+        MapTy::FlowMap => {
+            for ele in maps::get_filter_map(pin_path)?.iter() {
+                let (key, val) = ele?;
+                println!("Key: {key}");
+                println!("Val: {val}");
+                println!();
+            }
+        }
+        MapTy::IpPairMap => {
+            for ele in maps::get_ip_pair_map(pin_path)?.iter() {
+                let (key, val) = ele?;
+                println!("Key: {key}");
+                println!("Val: {val}");
+                println!();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -148,6 +212,14 @@ async fn main() -> anyhow::Result<()> {
             };
 
             println!("Found {} entries in map.", count)
+        }
+        // Dumps the map
+        Commands::Dump { map, json } => {
+            if json {
+                dump_command_json(pin_path, map)?;
+            } else {
+                dump_command_txt(pin_path, map)?;
+            }
         }
     }
 
