@@ -3,12 +3,14 @@ mod maps;
 use anyhow::Context as _;
 use aya::EbpfLoader;
 use aya::programs::{Xdp, XdpFlags, links::FdLink};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::debug;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -77,6 +79,14 @@ enum Commands {
         map: MapTy,
         #[arg(short, long)]
         json: bool,
+    },
+    Purge {
+        #[arg(long, value_enum, default_value_t)]
+        map: MapTy,
+        #[clap(value_parser = |s: &str| s.parse().map(Duration::from_secs))]
+        seconds: Duration,
+        #[arg(short, long)]
+        dry_run: bool,
     },
 }
 
@@ -158,6 +168,75 @@ fn dump_command_txt(pin_path: &Path, map: MapTy) -> anyhow::Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+fn purge_command(
+    pin_path: &Path,
+    map: MapTy,
+    seconds: std::time::Duration,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    match map {
+        MapTy::FlowMap => {
+            let mut filter_map = maps::get_filter_map(pin_path)?;
+            let now = Utc::now();
+            let stale_entries: Vec<(maps::CanonicalTuple, DateTime<Utc>)> = filter_map
+                .iter()
+                .filter_map(|key_val| {
+                    let (key, val) = key_val.ok()?;
+                    let last_packet_time = maps::datetime_from_timestamp(val.timestamp)?;
+                    (now > last_packet_time + seconds).then_some((key, last_packet_time))
+                })
+                .collect();
+
+            if dry_run {
+                eprintln!("[DRY RUN]");
+                eprintln!("Keys to be purged: ");
+                stale_entries.iter().for_each(|(key, last_packet_time)| {
+                    eprintln!(
+                        "{}: Last packet {} seconds ago",
+                        key,
+                        (now - last_packet_time).num_seconds()
+                    );
+                });
+            } else {
+                for (key, _) in stale_entries {
+                    let _ = filter_map.remove(&key);
+                }
+            }
+        }
+        MapTy::IpPairMap => {
+            let mut ip_pair_map = maps::get_ip_pair_map(pin_path)?;
+            let now = Utc::now();
+            let stale_entries: Vec<(maps::IPPair, DateTime<Utc>)> = ip_pair_map
+                .iter()
+                .filter_map(|key_val| {
+                    let (key, val) = key_val.ok()?;
+                    let last_packet_time = maps::datetime_from_timestamp(val.timestamp)?;
+                    (now > last_packet_time + seconds).then_some((key, last_packet_time))
+                })
+                .collect();
+
+            if dry_run {
+                eprintln!("[DRY RUN]");
+                eprintln!("Keys to be purged: ");
+                stale_entries.iter().for_each(|(key, last_packet_time)| {
+                    eprintln!(
+                        "{}: Last packet {} seconds ago",
+                        key,
+                        (now - last_packet_time).num_seconds()
+                    );
+                });
+            } else {
+                for (key, _) in stale_entries {
+                    let _ = ip_pair_map.remove(&key);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -220,6 +299,13 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 dump_command_txt(pin_path, map)?;
             }
+        }
+        Commands::Purge {
+            map,
+            seconds,
+            dry_run,
+        } => {
+            purge_command(pin_path, map, seconds, dry_run)?;
         }
     }
 

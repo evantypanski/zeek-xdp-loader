@@ -1,5 +1,6 @@
 use aya::Pod;
 use aya::maps::{HashMap, Map, MapData};
+use chrono::{DateTime, Utc};
 use nix::time::{ClockId, clock_gettime};
 use serde::{Serialize, Serializer};
 
@@ -80,14 +81,20 @@ impl fmt::Display for IPPair {
     }
 }
 
-fn format_timestamp(timestamp: u64) -> Option<String> {
+pub fn datetime_from_timestamp(timestamp: u64) -> Option<DateTime<Utc>> {
     let wall_clock_ns = get_boot_time_ns() + timestamp;
-    let datetime = chrono::DateTime::from_timestamp(
+    DateTime::from_timestamp(
         (wall_clock_ns / 1_000_000_000) as i64,
         (wall_clock_ns % 1_000_000_000) as u32,
-    )?;
+    )
+}
 
-    Some(datetime.format("%H:%M:%S%.3f").to_string())
+fn format_timestamp(timestamp: u64) -> Option<String> {
+    Some(
+        datetime_from_timestamp(timestamp)?
+            .format("%H:%M:%S%.3f")
+            .to_string(),
+    )
 }
 
 fn serialize_timestamp<S>(timestamp: &u64, serializer: S) -> Result<S::Ok, S::Error>
