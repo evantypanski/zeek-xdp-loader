@@ -7,8 +7,8 @@ use aya::programs::{Xdp, XdpFlags, links::FdLink};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::debug;
+use serde::Serialize;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -129,13 +129,15 @@ fn load_command(
 
 fn dump_command_json<K>(map: ShuntMap<K>) -> anyhow::Result<()>
 where
-    K: aya::Pod + fmt::Display,
+    K: aya::Pod + Serialize,
 {
-    let mut out = HashMap::new();
-    for ele in map.iter() {
-        let (key, val) = ele?;
-        out.insert(format!("{key}"), val);
-    }
+    let out: Vec<maps::MapEntry<K>> = map
+        .iter()
+        .map(|res| {
+            let (key, val) = res?;
+            Ok(maps::MapEntry { key, val })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let json_output = serde_json::to_string_pretty(&out)?;
     println!("{json_output}");

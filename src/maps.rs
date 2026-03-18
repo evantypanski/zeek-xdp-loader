@@ -37,6 +37,7 @@ pub struct CanonicalTuple {
     pub protocol: u16,
     pub outer_vlan_id: u16,
     pub inner_vlan_id: u16,
+    #[serde(skip)]
     pub _padding: u16,
 }
 
@@ -79,6 +80,12 @@ impl fmt::Display for IPPair {
             self.outer_vlan_id, self.inner_vlan_id
         )
     }
+}
+
+#[derive(Serialize)]
+pub struct MapEntry<K> {
+    pub key: K,
+    pub val: ShuntVal,
 }
 
 pub fn datetime_from_timestamp(timestamp: u64) -> Option<DateTime<Utc>> {
