@@ -2,6 +2,7 @@ mod maps;
 
 use anyhow::Context as _;
 use aya::EbpfLoader;
+use aya::maps::{HashMap as BpfHashMap, MapData};
 use aya::programs::{Xdp, XdpFlags, links::FdLink};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -90,6 +91,8 @@ enum Commands {
     },
 }
 
+type ShuntMap<K> = BpfHashMap<MapData, K, maps::ShuntVal>;
+
 fn load_command(
     obj: &str,
     pin_path: &Path,
@@ -124,22 +127,14 @@ fn load_command(
     Ok(())
 }
 
-fn dump_command_json(pin_path: &Path, map: MapTy) -> anyhow::Result<()> {
+fn dump_command_json<K>(map: ShuntMap<K>) -> anyhow::Result<()>
+where
+    K: aya::Pod + fmt::Display,
+{
     let mut out = HashMap::new();
-
-    match map {
-        MapTy::FlowMap => {
-            for ele in maps::get_filter_map(pin_path)?.iter() {
-                let (key, val) = ele?;
-                out.insert(format!("{key}"), val);
-            }
-        }
-        MapTy::IpPairMap => {
-            for ele in maps::get_ip_pair_map(pin_path)?.iter() {
-                let (key, val) = ele?;
-                out.insert(format!("{key}"), val);
-            }
-        }
+    for ele in map.iter() {
+        let (key, val) = ele?;
+        out.insert(format!("{key}"), val);
     }
 
     let json_output = serde_json::to_string_pretty(&out)?;
@@ -148,93 +143,56 @@ fn dump_command_json(pin_path: &Path, map: MapTy) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn dump_command_txt(pin_path: &Path, map: MapTy) -> anyhow::Result<()> {
-    println!("Dumping {}:", map);
-    match map {
-        MapTy::FlowMap => {
-            for ele in maps::get_filter_map(pin_path)?.iter() {
-                let (key, val) = ele?;
-                println!("Key: {key}");
-                println!("Val: {val}");
-                println!();
-            }
-        }
-        MapTy::IpPairMap => {
-            for ele in maps::get_ip_pair_map(pin_path)?.iter() {
-                let (key, val) = ele?;
-                println!("Key: {key}");
-                println!("Val: {val}");
-                println!();
-            }
-        }
+fn dump_command_txt<K>(map: ShuntMap<K>) -> anyhow::Result<()>
+where
+    K: aya::Pod + fmt::Display,
+{
+    println!("Dumping map");
+    for ele in map.iter() {
+        let (key, val) = ele?;
+        println!("Key: {key}");
+        println!("Val: {val}");
+        println!();
     }
 
     Ok(())
 }
 
-fn purge_command(
-    pin_path: &Path,
-    map: MapTy,
+fn purge_command<K>(
+    mut map: ShuntMap<K>,
     seconds: std::time::Duration,
     dry_run: bool,
-) -> anyhow::Result<()> {
-    match map {
-        MapTy::FlowMap => {
-            let mut filter_map = maps::get_filter_map(pin_path)?;
-            let now = Utc::now();
-            let stale_entries: Vec<(maps::CanonicalTuple, DateTime<Utc>)> = filter_map
-                .iter()
-                .filter_map(|key_val| {
-                    let (key, val) = key_val.ok()?;
-                    let last_packet_time = maps::datetime_from_timestamp(val.timestamp)?;
-                    (now > last_packet_time + seconds).then_some((key, last_packet_time))
-                })
-                .collect();
+) -> anyhow::Result<()>
+where
+    K: aya::Pod + fmt::Display,
+{
+    let now = Utc::now();
+    let stale_entries: Vec<(K, DateTime<Utc>)> = map
+        .iter()
+        .filter_map(|key_val| {
+            let (key, val) = key_val.ok()?;
+            let last_packet_time = maps::datetime_from_timestamp(val.timestamp)?;
+            (now > last_packet_time + seconds).then_some((key, last_packet_time))
+        })
+        .collect();
 
-            if dry_run {
-                eprintln!("[DRY RUN]");
-                eprintln!("Keys to be purged: ");
-                stale_entries.iter().for_each(|(key, last_packet_time)| {
-                    eprintln!(
-                        "{}: Last packet {} seconds ago",
-                        key,
-                        (now - last_packet_time).num_seconds()
-                    );
-                });
-            } else {
-                for (key, _) in stale_entries {
-                    let _ = filter_map.remove(&key);
-                }
-            }
+    let count = stale_entries.len();
+    if dry_run {
+        eprintln!("[DRY RUN]");
+        eprintln!("{count} keys to be purged: ");
+        stale_entries.iter().for_each(|(key, last_packet_time)| {
+            eprintln!(
+                "{}: Last packet {} seconds ago",
+                key,
+                (now - last_packet_time).num_seconds()
+            );
+        });
+    } else {
+        for (key, _) in stale_entries {
+            let _ = map.remove(&key);
         }
-        MapTy::IpPairMap => {
-            let mut ip_pair_map = maps::get_ip_pair_map(pin_path)?;
-            let now = Utc::now();
-            let stale_entries: Vec<(maps::IPPair, DateTime<Utc>)> = ip_pair_map
-                .iter()
-                .filter_map(|key_val| {
-                    let (key, val) = key_val.ok()?;
-                    let last_packet_time = maps::datetime_from_timestamp(val.timestamp)?;
-                    (now > last_packet_time + seconds).then_some((key, last_packet_time))
-                })
-                .collect();
 
-            if dry_run {
-                eprintln!("[DRY RUN]");
-                eprintln!("Keys to be purged: ");
-                stale_entries.iter().for_each(|(key, last_packet_time)| {
-                    eprintln!(
-                        "{}: Last packet {} seconds ago",
-                        key,
-                        (now - last_packet_time).num_seconds()
-                    );
-                });
-            } else {
-                for (key, _) in stale_entries {
-                    let _ = ip_pair_map.remove(&key);
-                }
-            }
-        }
+        eprintln!("Purged {count} entries.");
     }
 
     Ok(())
@@ -294,18 +252,34 @@ async fn main() -> anyhow::Result<()> {
         }
         // Dumps the map
         Commands::Dump { map, json } => {
-            if json {
-                dump_command_json(pin_path, map)?;
-            } else {
-                dump_command_txt(pin_path, map)?;
-            }
+            match map {
+                MapTy::FlowMap => {
+                    if json {
+                        dump_command_json(maps::get_filter_map(pin_path)?)?;
+                    } else {
+                        dump_command_txt(maps::get_filter_map(pin_path)?)?;
+                    }
+                }
+                MapTy::IpPairMap => {
+                    if json {
+                        dump_command_json(maps::get_ip_pair_map(pin_path)?)?;
+                    } else {
+                        dump_command_txt(maps::get_ip_pair_map(pin_path)?)?;
+                    }
+                }
+            };
         }
         Commands::Purge {
             map,
             seconds,
             dry_run,
         } => {
-            purge_command(pin_path, map, seconds, dry_run)?;
+            match map {
+                MapTy::FlowMap => purge_command(maps::get_filter_map(pin_path)?, seconds, dry_run)?,
+                MapTy::IpPairMap => {
+                    purge_command(maps::get_ip_pair_map(pin_path)?, seconds, dry_run)?
+                }
+            };
         }
     }
 
